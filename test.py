@@ -6,7 +6,7 @@ import os
 import re
 import sqlite3
 from difflib import SequenceMatcher
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 import requests
@@ -43,6 +43,20 @@ MENU_NICK = "🔎 Поиск по никнейму"
 MENU_STEAM = "🆔 Поиск по Steam ID"
 MENU_DONATE = "⭐ Пожертвование"
 MENU_BACK = "⬅️ Назад"
+PENDING_JOIN_TTL_HOURS = 48
+START_TEXT_SETTING_KEY = "start_message_text"
+DEFAULT_START_TEXT = (
+    "Выберите действие:\n"
+    f"• {MENU_NICK}\n"
+    f"• {MENU_STEAM}\n"
+    f"• {MENU_DONATE}"
+)
+ADMIN_ACTION_BROADCAST = "broadcast"
+ADMIN_ACTION_EDIT_START = "edit_start_text"
+INVITE_HASH_PATTERN = re.compile(
+    r"(?:https?://)?t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)|tg://join\?invite=([A-Za-z0-9_-]+)",
+    flags=re.IGNORECASE,
+)
 
 
 def parse_admin_ids(raw: str | None) -> set[int]:
@@ -58,6 +72,7 @@ def parse_admin_ids(raw: str | None) -> set[int]:
 
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS"))
 user_modes: dict[int, str] = {}
+admin_pending_actions: dict[int, str] = {}
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -131,6 +146,19 @@ def init_tracking_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS subscription_join_requests (
+                user_id INTEGER NOT NULL,
+                channel_ref TEXT NOT NULL,
+                chat_id TEXT,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, channel_ref)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS stats_counters (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL DEFAULT 0
@@ -142,7 +170,14 @@ def init_tracking_db():
             (os.getenv("REQUIRED_CHANNEL", "").strip(),),
         )
         conn.execute(
+            "INSERT OR IGNORE INTO bot_settings(key, value) VALUES ('required_channel_chat_id', '')"
+        )
+        conn.execute(
             "INSERT OR IGNORE INTO bot_settings(key, value) VALUES ('subscription_enabled', '1')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_settings(key, value) VALUES (?, ?)",
+            (START_TEXT_SETTING_KEY, DEFAULT_START_TEXT),
         )
         for key in (
             "search_user_clicks",
@@ -391,6 +426,134 @@ def set_setting(key: str, value: str):
             (key, value),
         )
         conn.commit()
+
+
+def get_start_message_text() -> str:
+    value = get_setting(START_TEXT_SETTING_KEY, "")
+    return value if value else DEFAULT_START_TEXT
+
+
+def extract_command_payload(raw_text: str, command_name: str) -> str:
+    text = raw_text or ""
+    lowered = text.lower()
+    prefix = f"/{command_name.lower()}"
+    if not lowered.startswith(prefix):
+        return ""
+    payload = text[len(prefix):]
+    if payload.startswith("@"):
+        bot_part = payload[1:].split(maxsplit=1)[0]
+        payload = payload[len(bot_part) + 1:]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    elif payload.startswith("\n"):
+        payload = payload[1:]
+    return payload
+
+
+def get_all_users_rows() -> list[tuple[int, str, str, int]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                u.user_id,
+                COALESCE(u.first_seen, ''),
+                COALESCE(u.last_seen, ''),
+                COALESCE(ua.total_queries, 0)
+            FROM users u
+            LEFT JOIN user_access ua ON ua.user_id = u.user_id
+            ORDER BY u.first_seen ASC, u.user_id ASC
+            """
+        ).fetchall()
+    return [(int(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in rows]
+
+
+def get_all_user_ids() -> list[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users ORDER BY user_id ASC"
+        ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def save_join_request_status(
+    user_id: int,
+    channel_ref: str,
+    status: str,
+    chat_id: str | None = None,
+):
+    channel_ref = normalize_channel_ref(channel_ref)
+    if not channel_ref:
+        return
+    ts = now_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO subscription_join_requests (
+                user_id, channel_ref, chat_id, status, requested_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, channel_ref) DO UPDATE SET
+                chat_id=COALESCE(excluded.chat_id, subscription_join_requests.chat_id),
+                status=excluded.status,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(user_id),
+                channel_ref,
+                (str(chat_id) if chat_id is not None else None),
+                status,
+                ts,
+                ts,
+            ),
+        )
+        conn.commit()
+
+
+def get_join_request_status(user_id: int, channel_ref: str) -> tuple[str | None, str | None]:
+    channel_ref = normalize_channel_ref(channel_ref)
+    if not channel_ref:
+        return None, None
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT status, updated_at
+            FROM subscription_join_requests
+            WHERE user_id=? AND channel_ref=?
+            """,
+            (int(user_id), channel_ref),
+        ).fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def get_known_chat_id_for_channel(channel_ref: str) -> str:
+    channel_ref = normalize_channel_ref(channel_ref)
+    if not channel_ref:
+        return ""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT chat_id
+            FROM subscription_join_requests
+            WHERE channel_ref=? AND chat_id IS NOT NULL AND chat_id != ''
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (channel_ref,),
+        ).fetchone()
+    return row[0] if row and row[0] else ""
+
+
+def has_fresh_pending_request(user_id: int, channel_ref: str) -> bool:
+    status, updated_at = get_join_request_status(user_id, channel_ref)
+    if status != "pending" or not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(updated_at)
+    except Exception:
+        return False
+    return updated >= datetime.utcnow() - timedelta(hours=PENDING_JOIN_TTL_HOURS)
 
 
 def ensure_user_access(user_id: int):
@@ -651,12 +814,61 @@ def main_menu_inline_kb():
     )
 
 
+def admin_tools_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_action:broadcast")],
+            [InlineKeyboardButton(text="📝 Стартовое сообщение", callback_data="admin_action:edit_start")],
+            [InlineKeyboardButton(text="👥 users", callback_data="admin_action:users")],
+        ]
+    )
+
+
+def extract_invite_hash(value: str) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    match = INVITE_HASH_PATTERN.search(raw)
+    if match:
+        return match.group(1) or match.group(2)
+    if raw.startswith("+") and re.fullmatch(r"[A-Za-z0-9_-]+", raw[1:] or ""):
+        return raw[1:]
+    return None
+
+
+def is_invite_channel_ref(value: str) -> bool:
+    return extract_invite_hash(value or "") is not None
+
+
+def invite_links_match(first: str, second: str) -> bool:
+    hash_a = extract_invite_hash(first)
+    hash_b = extract_invite_hash(second)
+    return bool(hash_a and hash_b and hash_a == hash_b)
+
+
+def is_same_channel_ref(channel_ref: str, chat_id: str | int | None, chat_username: str | None = None) -> bool:
+    normalized = normalize_channel_ref(channel_ref)
+    if not normalized or normalized == "-":
+        return False
+    if is_invite_channel_ref(normalized):
+        return False
+    candidates = set()
+    if chat_id is not None:
+        candidates.add(str(chat_id))
+    if chat_username:
+        candidates.add(normalize_channel_ref(chat_username))
+    return normalized in candidates
+
+
 def normalize_channel_ref(channel: str) -> str:
     ch = (channel or "").strip()
     if not ch:
         return ""
     if ch == "-":
         return "-"
+    invite_hash = extract_invite_hash(ch)
+    if invite_hash:
+        return f"https://t.me/+{invite_hash}"
     ch = ch.replace("https://", "").replace("http://", "")
     if ch.startswith("t.me/"):
         ch = ch[len("t.me/"):]
@@ -666,6 +878,19 @@ def normalize_channel_ref(channel: str) -> str:
     if not ch.startswith("@"):
         ch = f"@{ch}"
     return ch
+
+
+def subscription_required_kb() -> InlineKeyboardMarkup | None:
+    channel = normalize_channel_ref(get_setting("required_channel", "").strip())
+    if not channel or channel == "-":
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    if is_invite_channel_ref(channel):
+        rows.append([InlineKeyboardButton(text="📢 Открыть канал", url=channel)])
+    elif channel.startswith("@"):
+        rows.append([InlineKeyboardButton(text="📢 Открыть канал", url=f"https://t.me/{channel[1:]}")])
+    rows.append([InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def parse_steam_input(text: str) -> tuple[str, str]:
@@ -795,21 +1020,48 @@ def extract_star_amount(balance_data: dict | None) -> str:
 
 
 async def subscribed(user_id: int) -> tuple[bool | None, str]:
+    """Проверка подписки. Возвращает (is_ok, reason_code)"""
     channel = normalize_channel_ref(get_setting("required_channel", "").strip())
     if not channel or channel == "-":
         return True, "disabled"
-    try:
-        m = await bot.get_chat_member(channel, user_id)
-        if m.status in {"creator", "administrator", "member"}:
-            return True, "ok"
-        return (m.status == "restricted" and bool(getattr(m, "is_member", False))), "ok"
-    except Exception as e:
-        emsg = str(e)
-        logging.warning(f"sub check fail: {emsg}")
-        if "member list is inaccessible" in emsg.lower():
-            return None, "inaccessible"
-        return None, "error"
 
+    # Проверяем статус в базе (заявка / одобрено)
+    status, _ = get_join_request_status(user_id, channel)
+    has_fresh_pending = has_fresh_pending_request(user_id, channel)
+
+    # Заявка на вступление = доступ (даже если ещё не одобрена)
+    if status == "approved" or has_fresh_pending:
+        return True, "join_request_pending" if has_fresh_pending else "ok"
+
+    # Для приватных каналов через invite-link
+    if is_invite_channel_ref(channel):
+        chat_id = get_setting("required_channel_chat_id", "").strip() or get_known_chat_id_for_channel(channel)
+        if chat_id:
+            check_target = chat_id
+        else:
+            # Нет chat_id → пользователь должен отправить заявку
+            return False, "need_join_request"
+    else:
+        check_target = channel
+
+    try:
+        m = await bot.get_chat_member(check_target, user_id)
+        if m.status in {"creator", "administrator", "member"} or (
+            m.status == "restricted" and bool(getattr(m, "is_member", False))
+        ):
+            save_join_request_status(user_id, channel, "approved", str(check_target))
+            return True, "ok"
+    except Exception as e:
+        emsg = str(e).lower()
+        logging.warning(f"sub check fail for {user_id}: {emsg}")
+        if "member list is inaccessible" in emsg or "chat not found" in emsg:
+            return None, "inaccessible"
+
+    # Если не участник, но есть свежая заявка — всё равно пускаем
+    if has_fresh_pending:
+        return True, "join_request_pending"
+
+    return False, "not_subscribed"
 
 async def can_use_search(user_id: int) -> tuple[bool, str]:
     total = get_total_queries(user_id)
@@ -824,10 +1076,11 @@ async def can_use_search(user_id: int) -> tuple[bool, str]:
         return True, ""
 
     is_subscribed, reason_code = await subscribed(user_id)
+
     if is_subscribed is True:
         return True, ""
+
     if is_subscribed is None:
-        logging.warning(f"subscription check unavailable for user={user_id}, reason={reason_code}")
         if reason_code == "inaccessible":
             return False, (
                 f"Подписка обязательна, но бот не может проверить участников канала {channel}. "
@@ -835,8 +1088,14 @@ async def can_use_search(user_id: int) -> tuple[bool, str]:
             )
         return False, "Не удалось проверить подписку. Попробуйте позже."
 
-    return False, f"Для следующих запросов подпишитесь на канал: {channel}"
+    # === Главное исправление: теперь при приватном канале не пускаем бесплатно ===
+    if reason_code == "need_join_request":
+        return False, (
+            "Канал приватный. Перейдите по ссылке, отправьте заявку на вступление "
+            "и нажмите «✅ Проверить подписку»."
+        )
 
+    return False, f"Для следующих запросов подпишитесь на канал: {channel}"
 
 async def send_donation_invoice(chat_id: int, amount: int):
     await bot.send_invoice(
@@ -1172,6 +1431,50 @@ async def tracking_checker():
                     logging.error(f"Tracking error {player_id}: {e}")
 
 
+def build_users_report_text() -> str:
+    rows = get_all_users_rows()
+    lines = [f"Всего пользователей: {len(rows)}", ""]
+    for idx, (user_id, first_seen, last_seen, total_queries) in enumerate(rows, start=1):
+        lines.append(
+            f"{idx}. user_id={user_id} | first_seen={first_seen or '-'} | "
+            f"last_seen={last_seen or '-'} | total_queries={total_queries}"
+        )
+    return "\n".join(lines)
+
+
+async def send_users_report(target_message: types.Message):
+    report_text = build_users_report_text()
+    report_path = Path(__file__).with_name("users_report.txt")
+    report_path.write_text(report_text, encoding="utf-8")
+    await target_message.answer_document(
+        document=types.FSInputFile(str(report_path)),
+        caption=f"Список пользователей: {get_users_count()}",
+    )
+
+
+async def broadcast_text_to_all_users(text: str) -> tuple[int, int]:
+    user_ids = get_all_user_ids()
+    sent = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, text)
+            sent += 1
+        except Exception as e:
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after:
+                try:
+                    await asyncio.sleep(float(retry_after))
+                    await bot.send_message(user_id, text)
+                    sent += 1
+                    continue
+                except Exception:
+                    pass
+            failed += 1
+        await asyncio.sleep(0.04)
+    return sent, failed
+
+
 # ====================== HANDLERS ======================
 
 @dp.message(Command("start"))
@@ -1183,13 +1486,7 @@ async def start(message: types.Message):
     if len(parts) > 1:
         attach_referral_if_missing(message.from_user.id, parts[1].strip())
     user_modes[message.from_user.id] = "nickname"
-    await message.answer(
-        "Выберите действие:\n"
-        f"• {MENU_NICK}\n"
-        f"• {MENU_STEAM}\n"
-        f"• {MENU_DONATE}",
-        reply_markup=main_menu_inline_kb(),
-    )
+    await message.answer(get_start_message_text(), reply_markup=main_menu_inline_kb())
 
 
 async def do_nickname_search(message: types.Message, nickname: str, actor_user_id: int | None = None) -> bool:
@@ -1289,7 +1586,7 @@ async def do_steam_search(message: types.Message, raw_input: str) -> bool:
     await bot.send_chat_action(message.chat.id, "typing")
 
     if inp_type == "vanity":
-        await message.answer("🔍 Ищу SteamID...")
+        await message.answer("🔍 Ищу SteamID по vanity...")
         steamid = await resolve_vanity(value)
         if not steamid:
             await message.answer("❌ Не удалось найти SteamID по этому значению.")
@@ -1300,35 +1597,94 @@ async def do_steam_search(message: types.Message, raw_input: str) -> bool:
         await message.answer("❌ Введите SteamID64 или ссылку/ник Steam.")
         return False
 
+    # Получаем все данные из Steam
     player = await steam_player_info(steamid)
     if not player:
         await message.answer("❌ Не удалось получить данные Steam-профиля.")
         return False
 
-    name = player.get("personaname", "—")
-    profile_url = player.get("profileurl", f"https://steamcommunity.com/profiles/{steamid}/")
-    status_code = player.get("personastate", 0)
-    game_name = player.get("gameextrainfo", "Не в игре") if player.get("gameid") else "Не в игре"
+    # Часы в Rust
     hours = await rust_hours(steamid)
-    hours_text = f"{hours:.2f}" if hours is not None else "скрыто"
-    status = "🟢 В сети" if status_code != 0 else "🔴 Не в сети"
+    hours_text = f"{hours:.1f} часов" if hours is not None else "скрыто / не играл"
 
-    out = (
-        f"👤 Имя: {escape_html(name)}\n"
-        f"🆔 Steam_id: {escape_html(steamid)} (<a href=\"{escape_html(profile_url)}\">профиль</a>)\n"
-        f"💬 Статус: {status}\n"
-        f"🎮 Игра: {escape_html(game_name)}\n"
-        f"⏰ Часов в Rust: {escape_html(hours_text)}"
-    )
+    # Форматируем вывод
+    lines = [f"👤 <b>Steam профиль</b>\n"]
+
+    # Основная информация
+    lines.append(f"📛 Никнейм: <b>{escape_html(player.get('personaname', '—'))}</b>")
+
+    if player.get("realname"):
+        lines.append(f"🪪 Реальное имя: {escape_html(player.get('realname'))}")
+
+    lines.append(f"🆔 SteamID64: <code>{steamid}</code>")
+
+    # Ссылка на профиль
+    profile_url = player.get("profileurl") or f"https://steamcommunity.com/profiles/{steamid}/"
+    lines.append(f"🔗 Профиль: <a href=\"{escape_html(profile_url)}\">Открыть в Steam</a>")
+
+    # Аватар
+    if player.get("avatarfull"):
+        lines.append(f"🖼 Аватар: <a href=\"{escape_html(player.get('avatarfull'))}\">полная версия</a>")
+
+    # Статус
+    state = player.get("personastate", 0)
+    status_map = {
+        0: "🔴 Не в сети",
+        1: "🟢 В сети",
+        2: "🟡 Занят",
+        3: "🔵 Нет на месте",
+        4: "🟠 Спит",
+        5: "🟣 Ищет торговлю",
+        6: "⚫️ Ищет игру"
+    }
+    status_text = status_map.get(state, "Неизвестно")
+    lines.append(f"💬 Статус: <b>{status_text}</b>")
+
+    # Если играет
+    if player.get("gameid"):
+        game_name = player.get("gameextrainfo", "Играет в неизвестную игру")
+        lines.append(f"🎮 Сейчас играет: <b>{escape_html(game_name)}</b>")
+        if player.get("gameserverip"):
+            lines.append(f"🌐 Сервер: <code>{player.get('gameserverip')}</code>")
+
+    # Дата создания аккаунта
+    if player.get("timecreated"):
+        created = datetime.fromtimestamp(player["timecreated"]).strftime("%d.%m.%Y")
+        lines.append(f"📅 Аккаунт создан: {created}")
+
+    # Последний выход
+    if player.get("lastlogoff"):
+        last_log = datetime.fromtimestamp(player["lastlogoff"]).strftime("%d.%m.%Y %H:%M")
+        lines.append(f"⏰ Последний выход: {last_log}")
+
+    # Страна
+    if player.get("loccountrycode"):
+        country = player["loccountrycode"]
+        if player.get("locstatecode"):
+            country += f" / {player['locstatecode']}"
+        lines.append(f"🌍 Страна: {country}")
+
+    # Видимость профиля
+    vis = player.get("communityvisibilitystate")
+    vis_text = "🌐 Публичный" if vis == 3 else "🔒 Частный / Ограниченный"
+    lines.append(f"👁 Видимость профиля: {vis_text}")
+
+    # Часы в Rust
+    lines.append(f"⏳ Часов в Rust: <b>{hours_text}</b>")
+
+    # Собираем текст
+    text = "\n".join(lines)
+
+    # Кнопки
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👁 Отслеживать", callback_data=f"bm_track_steam:{steamid}")],
+            [InlineKeyboardButton(text="👁 Отслеживать игрока", callback_data=f"bm_track_steam:{steamid}")],
             [InlineKeyboardButton(text="🔎 Поиск по никнейму", callback_data=f"steam_to_nick:{steamid}")],
         ]
     )
-    await message.answer(out, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
-    return True
 
+    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
+    return True
 
 @dp.callback_query(lambda c: c.data.startswith("bm_search_page"))
 async def paginate_search(callback: types.CallbackQuery):
@@ -1491,7 +1847,11 @@ async def start_tracking(callback: types.CallbackQuery):
 
     ok, reason = await can_use_search(callback.from_user.id)
     if not ok:
-        await callback.message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
+        await callback.message.answer(
+            f"❌ {escape_html(reason)}",
+            parse_mode="HTML",
+            reply_markup=subscription_required_kb(),
+        )
         return
 
     increment_counter("tracking_clicks")
@@ -1539,6 +1899,63 @@ async def stop_tracking(callback: types.CallbackQuery):
         pass
 
 
+@dp.chat_join_request()
+async def on_chat_join_request(update: types.ChatJoinRequest):
+    channel_ref = normalize_channel_ref(get_setting("required_channel", "").strip())
+    if not channel_ref or channel_ref == "-":
+        return
+
+    chat_id = str(update.chat.id)
+    invite_link = normalize_channel_ref((update.invite_link.invite_link if update.invite_link else "").strip())
+
+    match = False
+    if is_invite_channel_ref(channel_ref):
+        if invite_link and invite_links_match(channel_ref, invite_link):
+            match = True
+        elif get_setting("required_channel_chat_id", "").strip() == chat_id:
+            match = True
+    else:
+        match = is_same_channel_ref(channel_ref, chat_id, update.chat.username)
+
+    if not match:
+        return
+
+    save_join_request_status(update.from_user.id, channel_ref, "pending", chat_id=chat_id)
+    if get_setting("required_channel_chat_id", "").strip() != chat_id:
+        set_setting("required_channel_chat_id", chat_id)
+    logging.info(f"Join request captured: user={update.from_user.id}, channel={channel_ref}, chat_id={chat_id}")
+
+
+@dp.chat_member()
+async def on_chat_member_update(update: types.ChatMemberUpdated):
+    channel_ref = normalize_channel_ref(get_setting("required_channel", "").strip())
+    if not channel_ref or channel_ref == "-":
+        return
+
+    chat_id = str(update.chat.id)
+    if is_invite_channel_ref(channel_ref):
+        known_chat_id = get_setting("required_channel_chat_id", "").strip()
+        if known_chat_id and known_chat_id != chat_id:
+            return
+    elif not is_same_channel_ref(channel_ref, chat_id, update.chat.username):
+        return
+
+    user = update.new_chat_member.user
+    if not user:
+        return
+    status = update.new_chat_member.status
+    is_member = status in {"creator", "administrator", "member"} or (
+        status == "restricted" and bool(getattr(update.new_chat_member, "is_member", False))
+    )
+    if is_member:
+        save_join_request_status(user.id, channel_ref, "approved", chat_id=chat_id)
+        if is_invite_channel_ref(channel_ref) and get_setting("required_channel_chat_id", "").strip() != chat_id:
+            set_setting("required_channel_chat_id", chat_id)
+        return
+    if status in {"left", "kicked"}:
+        save_join_request_status(user.id, channel_ref, "left", chat_id=chat_id)
+
+
 @dp.callback_query(lambda c: c.data == "check_sub")
 async def check_sub_callback(callback: types.CallbackQuery):
     if get_setting("subscription_enabled", "1") != "1":
@@ -1551,10 +1968,22 @@ async def check_sub_callback(callback: types.CallbackQuery):
     ok, reason = await subscribed(callback.from_user.id)
     try:
         if ok is True:
-            await callback.answer("Подписка подтверждена ✅", show_alert=True)
+            if reason == "join_request_pending":
+                await callback.answer("Заявка на вступление найдена ⏳", show_alert=True)
+            else:
+                await callback.answer("Подписка подтверждена ✅", show_alert=True)
         elif ok is False:
-            await callback.answer("Подписка не найдена ❌", show_alert=True)
+            if reason == "need_join_request":
+                await callback.answer("Сначала отправьте заявку по ссылке канала ❌", show_alert=True)
+            else:
+                await callback.answer("Подписка не найдена ❌", show_alert=True)
         else:
+            if reason == "private_channel_chat_id_missing":
+                await callback.answer(
+                    "Проверка уже подключена, но chat_id приватного канала ещё не определён.",
+                    show_alert=True,
+                )
+                return
             if reason == "inaccessible":
                 await callback.answer(
                     "Не могу проверить подписку: у бота нет доступа к списку участников канала.",
@@ -1582,6 +2011,42 @@ async def menu_mode_callback(callback: types.CallbackQuery):
     await callback.message.answer(text)
 
 
+@dp.callback_query(lambda c: c.data.startswith("admin_action:"))
+async def admin_action_callback(callback: types.CallbackQuery):
+    if not callback.from_user or not admin(callback.from_user.id):
+        try:
+            await callback.answer("Только для админа.", show_alert=True)
+        except TelegramBadRequest:
+            pass
+        return
+    action = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    try:
+        await callback.answer("Ок")
+    except TelegramBadRequest:
+        pass
+
+    if action == "broadcast":
+        admin_pending_actions[user_id] = ADMIN_ACTION_BROADCAST
+        await callback.message.answer(
+            "Режим рассылки включен.\n"
+            "Отправьте ОДНО сообщение — я разошлю его всем пользователям.\n"
+            "Для отмены: /cancel"
+        )
+        return
+    if action == "edit_start":
+        admin_pending_actions[user_id] = ADMIN_ACTION_EDIT_START
+        await callback.message.answer(
+            "Отправьте новый текст для /start.\n"
+            "Форматирование, переносы и табы будут сохранены.\n"
+            "Для отмены: /cancel"
+        )
+        return
+    if action == "users":
+        await send_users_report(callback.message)
+        return
+
+
 @dp.callback_query(lambda c: c.data.startswith("steam_to_nick:"))
 async def steam_to_nick_callback(callback: types.CallbackQuery):
     steamid = callback.data.split(":", 1)[1]
@@ -1592,7 +2057,11 @@ async def steam_to_nick_callback(callback: types.CallbackQuery):
 
     ok, reason = await can_use_search(callback.from_user.id)
     if not ok:
-        await callback.message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
+        await callback.message.answer(
+            f"❌ {escape_html(reason)}",
+            parse_mode="HTML",
+            reply_markup=subscription_required_kb(),
+        )
         return
 
     player = await steam_player_info(steamid)
@@ -1619,7 +2088,11 @@ async def track_from_steam_callback(callback: types.CallbackQuery):
 
     ok, reason = await can_use_search(callback.from_user.id)
     if not ok:
-        await callback.message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
+        await callback.message.answer(
+            f"❌ {escape_html(reason)}",
+            parse_mode="HTML",
+            reply_markup=subscription_required_kb(),
+        )
         return
 
     increment_counter("tracking_clicks")
@@ -1642,18 +2115,106 @@ async def menu_cmd(message: types.Message):
     await message.answer("Главное меню открыто.", reply_markup=main_menu_inline_kb())
 
 
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if not admin(message.from_user.id):
+        await message.answer("Команда только для админа.")
+        return
+    await message.answer("Панель администратора:", reply_markup=admin_tools_kb())
+
+
+@dp.message(Command("starttext"))
+async def cmd_starttext(message: types.Message):
+    if not admin(message.from_user.id):
+        await message.answer("Команда только для админа.")
+        return
+    payload = extract_command_payload(message.text or "", "starttext")
+    if payload != "":
+        set_setting(START_TEXT_SETTING_KEY, payload)
+        await message.answer("Стартовое сообщение обновлено. Предпросмотр:")
+        await message.answer(get_start_message_text(), reply_markup=main_menu_inline_kb())
+        return
+    admin_pending_actions[message.from_user.id] = ADMIN_ACTION_EDIT_START
+    await message.answer(
+        "Отправьте новый текст для /start.\n"
+        "Форматирование, переносы и табы будут сохранены.\n"
+        "Для отмены: /cancel"
+    )
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: types.Message):
+    if not admin(message.from_user.id):
+        await message.answer("Команда только для админа.")
+        return
+    await send_users_report(message)
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message):
+    if not admin(message.from_user.id):
+        await message.answer("Нечего отменять.")
+        return
+    if admin_pending_actions.pop(message.from_user.id, None):
+        await message.answer("Режим админ-действия отменен.")
+    else:
+        await message.answer("Активных админ-действий нет.")
+
+
 @dp.message(Command("setchannel"))
 async def cmd_setchannel(message: types.Message):
     if not admin(message.from_user.id):
         await message.answer("Команда только для админа.")
         return
+
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Формат: /setchannel <@channel или ->")
+        await message.answer("Формат: /setchannel <@channel | chat_id | ссылка-приглашение | ->")
         return
+
+    previous_channel = normalize_channel_ref(get_setting("required_channel", "").strip())
     channel = normalize_channel_ref(parts[1].strip())
+
     set_setting("required_channel", channel)
-    await message.answer(f"Канал для подписки обновлен: {escape_html(channel)}", parse_mode="HTML")
+
+    if channel != previous_channel:
+        # === ЖЁСТКИЙ СБРОС ПОДПИСКИ ПРИ СМЕНЕ КАНАЛА ===
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM subscription_join_requests")
+            conn.commit()
+        logging.info(f"✅ Все статусы подписки сброшены после смены канала на: {channel}")
+
+        if channel.lstrip("-").isdigit():
+            set_setting("required_channel_chat_id", channel)
+        else:
+            set_setting("required_channel_chat_id", "")
+
+    await message.answer(
+        "✅ Канал для подписки обновлён:\n"
+        f"{escape_html(channel)}\n\n"
+        "Теперь **все** пользователи (старые и новые) должны отправить заявку или подписаться.",
+        parse_mode="HTML",
+    )
+
+@dp.message(Command("setchannelid"))
+async def cmd_setchannelid(message: types.Message):
+    if not admin(message.from_user.id):
+        await message.answer("Команда только для админа.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /setchannelid <-100...>")
+        return
+    chat_id = parts[1].strip()
+    if not chat_id.lstrip("-").isdigit():
+        await message.answer("chat_id должен быть числом, например: -1001234567890")
+        return
+    set_setting("required_channel_chat_id", chat_id)
+    await message.answer(
+        "Chat ID для проверки подписки сохранен.\n"
+        f"Теперь бот проверяет участников через: {escape_html(chat_id)}",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("sub"))
@@ -1685,10 +2246,12 @@ async def cmd_settings(message: types.Message):
     report_path.write_text(report_text, encoding="utf-8")
 
     channel = get_setting("required_channel", "(не задан)")
+    channel_chat_id = get_setting("required_channel_chat_id", "(не определен)")
     sub_state = "ON" if get_setting("subscription_enabled", "1") == "1" else "OFF"
     await message.answer(
         "Настройки:\n"
         f"📢 Канал: {channel}\n"
+        f"🆔 Chat ID канала: {channel_chat_id}\n"
         f"🔒 Проверка подписки: {sub_state}"
     )
     await message.answer_document(
@@ -1720,14 +2283,38 @@ async def on_successful_payment(message: types.Message):
 async def main_text_handler(message: types.Message):
     if not message.from_user:
         return
-    text = (message.text or "").strip()
+    text_raw = message.text or ""
+    if not text_raw:
+        return
+
+    user_id = message.from_user.id
+    if admin(user_id):
+        pending_action = admin_pending_actions.get(user_id)
+        if pending_action:
+            if text_raw.strip().lower() == "/cancel":
+                admin_pending_actions.pop(user_id, None)
+                await message.answer("Режим админ-действия отменен.")
+                return
+            if pending_action == ADMIN_ACTION_EDIT_START:
+                set_setting(START_TEXT_SETTING_KEY, text_raw)
+                admin_pending_actions.pop(user_id, None)
+                await message.answer("Стартовое сообщение обновлено. Предпросмотр:")
+                await message.answer(get_start_message_text(), reply_markup=main_menu_inline_kb())
+                return
+            if pending_action == ADMIN_ACTION_BROADCAST:
+                admin_pending_actions.pop(user_id, None)
+                await message.answer("Начинаю рассылку...")
+                sent, failed = await broadcast_text_to_all_users(text_raw)
+                await message.answer(f"Рассылка завершена.\nДоставлено: {sent}\nОшибок: {failed}")
+                return
+
+    text = text_raw.strip()
     if not text:
         return
     if text.startswith("/"):
         await message.answer("Неизвестная команда. Используй /menu")
         return
 
-    user_id = message.from_user.id
     touch_user(user_id)
 
     if text == MENU_BACK:
@@ -1763,7 +2350,11 @@ async def main_text_handler(message: types.Message):
 
     ok, reason = await can_use_search(user_id)
     if not ok:
-        await message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
+        await message.answer(
+            f"❌ {escape_html(reason)}",
+            parse_mode="HTML",
+            reply_markup=subscription_required_kb(),
+        )
         return
 
     if mode == "steam":
