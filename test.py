@@ -1986,7 +1986,7 @@ async def check_sub_callback(callback: types.CallbackQuery):
                 return
             if reason == "inaccessible":
                 await callback.answer(
-                    "Не могу проверить подписку: у бота нет доступа к списку участников канала.",
+                    "Нее могу проверить подписку: у бота нет доступа к списку участников канала.",
                     show_alert=True,
                 )
             else:
