@@ -647,7 +647,6 @@ def main_menu_inline_kb():
             [InlineKeyboardButton(text=MENU_NICK, callback_data="menu_mode:nickname")],
             [InlineKeyboardButton(text=MENU_STEAM, callback_data="menu_mode:steam")],
             [InlineKeyboardButton(text=MENU_DONATE, callback_data="menu_mode:donate")],
-            [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")],
         ]
     )
 
@@ -815,28 +814,26 @@ async def subscribed(user_id: int) -> tuple[bool | None, str]:
 async def can_use_search(user_id: int) -> tuple[bool, str]:
     total = get_total_queries(user_id)
     if total == 0:
-        increment_total_queries(user_id)
         return True, ""
 
     if get_setting("subscription_enabled", "1") != "1":
-        increment_total_queries(user_id)
         return True, ""
 
     channel = normalize_channel_ref(get_setting("required_channel", "").strip())
     if not channel or channel == "-":
-        increment_total_queries(user_id)
         return True, ""
 
     is_subscribed, reason_code = await subscribed(user_id)
     if is_subscribed is True:
-        increment_total_queries(user_id)
         return True, ""
     if is_subscribed is None:
-        # If Telegram API cannot verify membership (e.g., member list inaccessible),
-        # do not hard-block users with false negatives.
         logging.warning(f"subscription check unavailable for user={user_id}, reason={reason_code}")
-        increment_total_queries(user_id)
-        return True, ""
+        if reason_code == "inaccessible":
+            return False, (
+                f"Подписка обязательна, но бот не может проверить участников канала {channel}. "
+                f"Обратитесь к администратору."
+            )
+        return False, "Не удалось проверить подписку. Попробуйте позже."
 
     return False, f"Для следующих запросов подпишитесь на канал: {channel}"
 
@@ -1195,7 +1192,7 @@ async def start(message: types.Message):
     )
 
 
-async def do_nickname_search(message: types.Message, nickname: str, actor_user_id: int | None = None):
+async def do_nickname_search(message: types.Message, nickname: str, actor_user_id: int | None = None) -> bool:
     increment_counter("search_user_clicks")
     request_user_id = actor_user_id if actor_user_id is not None else (message.from_user.id if message.from_user else None)
     safe_nickname = escape_html(nickname)
@@ -1232,6 +1229,7 @@ async def do_nickname_search(message: types.Message, nickname: str, actor_user_i
             await message.answer("❌ На этой странице нет игроков с похожестью 80%+. Попробуй следующую страницу.")
         else:
             await message.answer("❌ Игроков с похожестью 80%+ не найдено.")
+        return False
 
     if len(players) == 1:
         await send_player_profile_details(message, players[0]["id"], viewer_user_id=request_user_id)
@@ -1278,12 +1276,14 @@ async def do_nickname_search(message: types.Message, nickname: str, actor_user_i
         nav_kb = InlineKeyboardMarkup(inline_keyboard=[nav_buttons]) if nav_buttons else None
         await message.answer(nav_text, reply_markup=nav_kb, parse_mode="HTML")
 
+    return True
 
-async def do_steam_search(message: types.Message, raw_input: str):
+
+async def do_steam_search(message: types.Message, raw_input: str) -> bool:
     increment_counter("search_user_clicks")
     if not STEAM_API_KEY:
         await message.answer("❌ STEAM_API_KEY не настроен в .env")
-        return
+        return False
 
     value, inp_type = parse_steam_input(raw_input)
     await bot.send_chat_action(message.chat.id, "typing")
@@ -1293,17 +1293,17 @@ async def do_steam_search(message: types.Message, raw_input: str):
         steamid = await resolve_vanity(value)
         if not steamid:
             await message.answer("❌ Не удалось найти SteamID по этому значению.")
-            return
+            return False
     elif inp_type == "steamid":
         steamid = value
     else:
         await message.answer("❌ Введите SteamID64 или ссылку/ник Steam.")
-        return
+        return False
 
     player = await steam_player_info(steamid)
     if not player:
         await message.answer("❌ Не удалось получить данные Steam-профиля.")
-        return
+        return False
 
     name = player.get("personaname", "—")
     profile_url = player.get("profileurl", f"https://steamcommunity.com/profiles/{steamid}/")
@@ -1327,6 +1327,7 @@ async def do_steam_search(message: types.Message, raw_input: str):
         ]
     )
     await message.answer(out, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
+    return True
 
 
 @dp.callback_query(lambda c: c.data.startswith("bm_search_page"))
@@ -1483,14 +1484,20 @@ async def show_profile(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("bm_track:"))
 async def start_tracking(callback: types.CallbackQuery):
-    increment_counter("tracking_clicks")
     try:
         await callback.answer("Добавляю в отслеживание...")
     except TelegramBadRequest:
         pass
 
+    ok, reason = await can_use_search(callback.from_user.id)
+    if not ok:
+        await callback.message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
+        return
+
+    increment_counter("tracking_clicks")
     player_id = callback.data.split(":")[1]
     name, already_tracked = await add_tracking_for_user(callback.from_user.id, player_id)
+    increment_total_queries(callback.from_user.id)
 
     text = (
         f"✅ Игрок <b>{escape_html(name)}</b> добавлен в отслеживание.\n"
@@ -1585,13 +1592,7 @@ async def steam_to_nick_callback(callback: types.CallbackQuery):
 
     ok, reason = await can_use_search(callback.from_user.id)
     if not ok:
-        await callback.message.answer(
-            f"❌ {escape_html(reason)}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")]]
-            ),
-        )
+        await callback.message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
         return
 
     player = await steam_player_info(steamid)
@@ -1599,28 +1600,36 @@ async def steam_to_nick_callback(callback: types.CallbackQuery):
     if not nickname:
         await callback.message.answer("❌ Не удалось получить ник из Steam-профиля.")
         return
-    await do_nickname_search(
+    success = await do_nickname_search(
         callback.message,
         nickname,
         actor_user_id=(callback.from_user.id if callback.from_user else None),
     )
+    if success:
+        increment_total_queries(callback.from_user.id)
 
 
 @dp.callback_query(lambda c: c.data.startswith("bm_track_steam:"))
 async def track_from_steam_callback(callback: types.CallbackQuery):
-    increment_counter("tracking_clicks")
     steamid = callback.data.split(":", 1)[1]
     try:
         await callback.answer("Добавляю в отслеживание...")
     except TelegramBadRequest:
         pass
 
+    ok, reason = await can_use_search(callback.from_user.id)
+    if not ok:
+        await callback.message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
+        return
+
+    increment_counter("tracking_clicks")
     player_id = await bm_find_player_by_steamid(steamid)
     if not player_id:
         await callback.message.answer("❌ Не удалось найти BattleMetrics player_id по этому Steam ID.")
         return
 
     name, already = await add_tracking_for_user(callback.from_user.id, player_id)
+    increment_total_queries(callback.from_user.id)
     text = f"✅ Игрок <b>{escape_html(name)}</b> добавлен в отслеживание."
     if already:
         text = f"ℹ️ Игрок <b>{escape_html(name)}</b> уже был в отслеживании."
@@ -1754,23 +1763,23 @@ async def main_text_handler(message: types.Message):
 
     ok, reason = await can_use_search(user_id)
     if not ok:
-        await message.answer(
-            f"❌ {escape_html(reason)}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")]]
-            ),
-        )
+        await message.answer(f"❌ {escape_html(reason)}", parse_mode="HTML")
         return
 
     if mode == "steam":
         if is_probable_steam_input(text):
-            await do_steam_search(message, text)
+            success = await do_steam_search(message, text)
+            if success:
+                increment_total_queries(user_id)
         else:
             # Keep nickname search behavior stable even if steam mode was selected earlier.
-            await do_nickname_search(message, text)
+            success = await do_nickname_search(message, text)
+            if success:
+                increment_total_queries(user_id)
     else:
-        await do_nickname_search(message, text)
+        success = await do_nickname_search(message, text)
+        if success:
+            increment_total_queries(user_id)
 
 
 # ====================== RUN ======================
