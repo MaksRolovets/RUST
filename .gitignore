@@ -1,0 +1,14 @@
+*
+!test.py
+!.gitignore
+
+# Игнорируем всё лишнее
+.env
+*.sqlite3
+__pycache__/
+*.pyc
+*.log
+venv/
+settings_report.txt
+users_report.txt
+EOF
