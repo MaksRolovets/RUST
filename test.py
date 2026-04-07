@@ -31,6 +31,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BM_TOKEN = os.getenv("BATTLEMETRICS_TOKEN")
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 
+
+
 if not TELEGRAM_TOKEN or not BM_TOKEN:
     raise ValueError("❌ Нет токена")
 
@@ -73,6 +75,8 @@ def parse_admin_ids(raw: str | None) -> set[int]:
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS"))
 user_modes: dict[int, str] = {}
 admin_pending_actions: dict[int, str] = {}
+pending_search_requests: dict[int, tuple[str, str]] = {}
+tracking_view_messages: dict[int, list[int]] = {}
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -94,6 +98,7 @@ def init_tracking_db():
                 steam_id TEXT,
                 last_stop TEXT,
                 last_server_id TEXT,
+                tracked_at TEXT,
                 PRIMARY KEY (user_id, player_id)
             )
             """
@@ -165,6 +170,7 @@ def init_tracking_db():
             )
             """
         )
+
         conn.execute(
             "INSERT OR IGNORE INTO bot_settings(key, value) VALUES ('required_channel', ?)",
             (os.getenv("REQUIRED_CHANNEL", "").strip(),),
@@ -179,6 +185,7 @@ def init_tracking_db():
             "INSERT OR IGNORE INTO bot_settings(key, value) VALUES (?, ?)",
             (START_TEXT_SETTING_KEY, DEFAULT_START_TEXT),
         )
+
         for key in (
             "search_user_clicks",
             "details_clicks",
@@ -191,7 +198,7 @@ def init_tracking_db():
                 (key,),
             )
 
-        # ---- DB migrations for old schemas ----
+        # ---- DB migrations ----
         user_cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(users)").fetchall()
@@ -202,20 +209,22 @@ def init_tracking_db():
         if "last_seen" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
 
-        # Backfill timestamps for existing users from legacy created_at when possible.
-        user_cols = {
+        # Миграция для отслеживаний (добавляем tracked_at)
+        tracked_cols = {
             row[1]
-            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            for row in conn.execute("PRAGMA table_info(tracked_players)").fetchall()
             if row and len(row) > 1
         }
-        if "created_at" in user_cols:
-            conn.execute(
-                """
-                UPDATE users
-                SET first_seen = COALESCE(first_seen, created_at),
-                    last_seen = COALESCE(last_seen, created_at)
-                """
-            )
+        if "tracked_at" not in tracked_cols:
+            conn.execute("ALTER TABLE tracked_players ADD COLUMN tracked_at TEXT")
+            print("✅ Добавлена колонка tracked_at (сброс каждые 24 часа)")
+
+        # Заполняем старые записи текущим временем
+        conn.execute(
+            "UPDATE tracked_players SET tracked_at = ? WHERE tracked_at IS NULL",
+            (now_iso(),)
+        )
+
         now_ts = now_iso()
         conn.execute(
             """
@@ -225,9 +234,7 @@ def init_tracking_db():
             """,
             (now_ts, now_ts),
         )
-
         conn.commit()
-
 
 def load_trackings():
     global trackings
@@ -235,19 +242,20 @@ def load_trackings():
     try:
         with sqlite3.connect(DB_PATH) as conn:
             rows = conn.execute(
-                "SELECT user_id, player_id, name, steam_id, last_stop, last_server_id FROM tracked_players"
+                "SELECT user_id, player_id, name, steam_id, last_stop, last_server_id, tracked_at "
+                "FROM tracked_players"
             ).fetchall()
-        for user_id, player_id, name, steam_id, last_stop, last_server_id in rows:
+        for user_id, player_id, name, steam_id, last_stop, last_server_id, tracked_at in rows:
             trackings[int(user_id)][str(player_id)] = {
                 "name": name or "Unknown",
                 "steam_id": steam_id or None,
                 "last_stop": last_stop,
                 "last_server_id": last_server_id,
+                "tracked_at": tracked_at,
             }
         print(f"✅ Загружено отслеживаний: {sum(len(p) for p in trackings.values())}")
     except Exception as e:
         logging.error(f"Load tracking error: {e}")
-
 
 def save_trackings():
     try:
@@ -257,8 +265,9 @@ def save_trackings():
                 for player_id, info in players.items():
                     conn.execute(
                         """
-                        INSERT INTO tracked_players (user_id, player_id, name, steam_id, last_stop, last_server_id)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO tracked_players 
+                        (user_id, player_id, name, steam_id, last_stop, last_server_id, tracked_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             int(user_id),
@@ -267,12 +276,28 @@ def save_trackings():
                             info.get("steam_id"),
                             info.get("last_stop"),
                             info.get("last_server_id"),
+                            info.get("tracked_at"),
                         ),
                     )
             conn.commit()
     except Exception as e:
         logging.error(f"Save tracking error: {e}")
 
+def cleanup_expired_trackings(user_id: int | None = None):
+    """Удаляет отслеживания старше 24 часов"""
+    threshold = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        if user_id is None:
+            conn.execute("DELETE FROM tracked_players WHERE tracked_at < ?", (threshold,))
+        else:
+            conn.execute(
+                "DELETE FROM tracked_players WHERE user_id=? AND tracked_at < ?",
+                (user_id, threshold)
+            )
+        conn.commit()
+
+    # Обновляем кэш в памяти
+    load_trackings()
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat()
@@ -810,6 +835,7 @@ def main_menu_inline_kb():
             [InlineKeyboardButton(text=MENU_NICK, callback_data="menu_mode:nickname")],
             [InlineKeyboardButton(text=MENU_STEAM, callback_data="menu_mode:steam")],
             [InlineKeyboardButton(text=MENU_DONATE, callback_data="menu_mode:donate")],
+            [InlineKeyboardButton(text="👁 Мои отслеживания", callback_data="my_trackings")],
         ]
     )
 
@@ -1097,6 +1123,15 @@ async def can_use_search(user_id: int) -> tuple[bool, str]:
 
     return False, f"Для следующих запросов подпишитесь на канал: {channel}"
 
+
+async def run_search_by_mode(message: types.Message, user_id: int, text: str, mode: str) -> bool:
+    if mode == "steam":
+        if is_probable_steam_input(text):
+            return await do_steam_search(message, text)
+        # Keep nickname search behavior stable even if steam mode was selected earlier.
+        return await do_nickname_search(message, text)
+    return await do_nickname_search(message, text)
+
 async def send_donation_invoice(chat_id: int, amount: int):
     await bot.send_invoice(
         chat_id=chat_id,
@@ -1137,6 +1172,11 @@ async def bm_find_player_by_steamid(steamid: str) -> str | None:
 
 
 async def add_tracking_for_user(user_id: int, player_id: str) -> tuple[str, bool]:
+    cleanup_expired_trackings(user_id)  # сбрасываем просроченные
+
+    if len(trackings.get(user_id, {})) >= 5:
+        return "❌ Достигнут лимит — максимум 5 отслеживаний одновременно.", False
+
     player = await bm_get_player(player_id)
     name = player.get("data", {}).get("attributes", {}).get("name", "Unknown")
     steam_id = extract_steam_id(player)
@@ -1154,15 +1194,16 @@ async def add_tracking_for_user(user_id: int, player_id: str) -> tuple[str, bool
         current_server_id = None
 
     already_tracked = player_id in trackings.get(user_id, {})
+
     trackings[user_id][player_id] = {
         "name": name,
         "steam_id": steam_id,
         "last_stop": current_stop,
         "last_server_id": current_server_id,
+        "tracked_at": now_iso(),
     }
     save_trackings()
     return name, already_tracked
-
 
 def prioritize_exact_nickname(players, nickname: str):
     def sort_key(player):
@@ -1375,6 +1416,7 @@ async def send_player_profile_details(
 async def tracking_checker():
     while True:
         await asyncio.sleep(90)
+        cleanup_expired_trackings()
         for user_id, tracked_players in list(trackings.items()):
             for player_id, info in list(tracked_players.items()):
                 try:
@@ -1837,6 +1879,62 @@ async def show_profile(callback: types.CallbackQuery):
         viewer_user_id=(callback.from_user.id if callback.from_user else None),
     )
 
+@dp.callback_query(lambda c: c.data == "my_trackings")
+async def my_trackings_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    cleanup_expired_trackings(user_id)
+
+    tracked = trackings.get(user_id, {})
+    if not tracked:
+        await callback.answer("У вас пока нет отслеживаний.", show_alert=True)
+        return
+
+    await callback.answer("Ваши отслеживания:")
+
+    # Очищаем старые сообщения, если они были
+    if user_id in tracking_view_messages:
+        for msg_id in tracking_view_messages[user_id]:
+            try:
+                await bot.delete_message(callback.message.chat.id, msg_id)
+            except:
+                pass
+        tracking_view_messages.pop(user_id, None)
+
+    sent_messages = []  # сюда собираем id всех отправленных сообщений
+
+    for player_id, info in list(tracked.items()):
+        name = info.get("name", "Unknown")
+        last_stop = info.get("last_stop")
+        status = "🟢 В сети" if last_stop is None else "🔴 Не в сети"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"bm_untrack:{player_id}"),
+            InlineKeyboardButton(text="🔎 Подробнее", callback_data=f"bm_profile:{player_id}")
+        ]])
+
+        msg = await callback.message.answer(
+            f"👤 <b>{escape_html(name)}</b>\n"
+            f"💬 Статус: {status}",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        sent_messages.append(msg.message_id)
+
+    # Финальное сообщение с кнопкой «В главное меню»
+    menu_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_to_main_menu")
+    ]])
+
+    final_msg = await callback.message.answer(
+        "👁 <b>Отслеживания показаны.</b>\n"
+        "Нажмите кнопку ниже, чтобы вернуться в меню.",
+        parse_mode="HTML",
+        reply_markup=menu_kb
+    )
+    sent_messages.append(final_msg.message_id)
+
+    # Сохраняем id сообщений, чтобы потом их удалить
+    tracking_view_messages[user_id] = sent_messages
 
 @dp.callback_query(lambda c: c.data.startswith("bm_track:"))
 async def start_tracking(callback: types.CallbackQuery):
@@ -1873,6 +1971,26 @@ async def start_tracking(callback: types.CallbackQuery):
         reply_markup=tracking_controls_kb(player_id),
     )
 
+@dp.callback_query(lambda c: c.data == "back_to_main_menu")
+async def back_to_main_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    # Удаляем все сообщения с отслеживаниями
+    if user_id in tracking_view_messages:
+        for msg_id in tracking_view_messages[user_id]:
+            try:
+                await bot.delete_message(callback.message.chat.id, msg_id)
+            except:
+                pass
+        tracking_view_messages.pop(user_id, None)
+
+    await callback.answer("Возвращаемся в главное меню...")
+
+    # Отправляем стартовое сообщение
+    await callback.message.answer(
+        get_start_message_text(),
+        reply_markup=main_menu_inline_kb()
+    )
 
 @dp.callback_query(lambda c: c.data.startswith("bm_untrack:"))
 async def stop_tracking(callback: types.CallbackQuery):
@@ -1972,6 +2090,15 @@ async def check_sub_callback(callback: types.CallbackQuery):
                 await callback.answer("Заявка на вступление найдена ⏳", show_alert=True)
             else:
                 await callback.answer("Подписка подтверждена ✅", show_alert=True)
+
+            # Возобновляем последний отложенный поисковый запрос пользователя.
+            pending = pending_search_requests.pop(callback.from_user.id, None)
+            if pending and callback.message:
+                pending_mode, pending_text = pending
+                await callback.message.answer("🔄 Возобновляю ваш последний запрос...")
+                success = await run_search_by_mode(callback.message, callback.from_user.id, pending_text, pending_mode)
+                if success:
+                    increment_total_queries(callback.from_user.id)
         elif ok is False:
             if reason == "need_join_request":
                 await callback.answer("Сначала отправьте заявку по ссылке канала ❌", show_alert=True)
@@ -2350,6 +2477,7 @@ async def main_text_handler(message: types.Message):
 
     ok, reason = await can_use_search(user_id)
     if not ok:
+        pending_search_requests[user_id] = (mode, text)
         await message.answer(
             f"❌ {escape_html(reason)}",
             parse_mode="HTML",
@@ -2357,20 +2485,9 @@ async def main_text_handler(message: types.Message):
         )
         return
 
-    if mode == "steam":
-        if is_probable_steam_input(text):
-            success = await do_steam_search(message, text)
-            if success:
-                increment_total_queries(user_id)
-        else:
-            # Keep nickname search behavior stable even if steam mode was selected earlier.
-            success = await do_nickname_search(message, text)
-            if success:
-                increment_total_queries(user_id)
-    else:
-        success = await do_nickname_search(message, text)
-        if success:
-            increment_total_queries(user_id)
+    success = await run_search_by_mode(message, user_id, text, mode)
+    if success:
+        increment_total_queries(user_id)
 
 
 # ====================== RUN ======================
