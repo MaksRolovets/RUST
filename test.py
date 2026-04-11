@@ -1090,10 +1090,7 @@ async def subscribed(user_id: int) -> tuple[bool | None, str]:
     return False, "not_subscribed"
 
 async def can_use_search(user_id: int) -> tuple[bool, str]:
-    total = get_total_queries(user_id)
-    if total == 0:
-        return True, ""
-
+    """Проверка возможности поиска. Теперь подписка требуется СРАЗУ с первого запроса."""
     if get_setting("subscription_enabled", "1") != "1":
         return True, ""
 
@@ -1106,6 +1103,7 @@ async def can_use_search(user_id: int) -> tuple[bool, str]:
     if is_subscribed is True:
         return True, ""
 
+    # Если подписка не подтверждена
     if is_subscribed is None:
         if reason_code == "inaccessible":
             return False, (
@@ -1114,15 +1112,13 @@ async def can_use_search(user_id: int) -> tuple[bool, str]:
             )
         return False, "Не удалось проверить подписку. Попробуйте позже."
 
-    # === Главное исправление: теперь при приватном канале не пускаем бесплатно ===
     if reason_code == "need_join_request":
         return False, (
             "Канал приватный. Перейдите по ссылке, отправьте заявку на вступление "
             "и нажмите «✅ Проверить подписку»."
         )
 
-    return False, f"Для следующих запросов подпишитесь на канал: {channel}"
-
+    return False, f"Для использования бота подпишитесь на канал: {channel}"
 
 async def run_search_by_mode(message: types.Message, user_id: int, text: str, mode: str) -> bool:
     if mode == "steam":
@@ -1485,14 +1481,60 @@ def build_users_report_text() -> str:
 
 
 async def send_users_report(target_message: types.Message):
-    report_text = build_users_report_text()
+    """Отправляет отчёт по пользователям с username и дописывает в файл"""
+    current_count = get_users_count()
     report_path = Path(__file__).with_name("users_report.txt")
-    report_path.write_text(report_text, encoding="utf-8")
+    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+    # Заголовок отчёта
+    header = f"""
+{'='*85}
+🔄 ОТЧЁТ ПО ПОЛЬЗОВАТЕЛЯМ — {timestamp}
+{'='*85}
+📊 Всего пользователей в БД сейчас: {current_count}
+{'='*85}
+
+Список пользователей:
+"""
+
+    # Собираем список пользователей с попыткой получить username
+    rows = get_all_users_rows()
+    body = ""
+
+    for idx, (user_id, first_seen, last_seen, total_queries) in enumerate(rows, start=1):
+        username = "—"
+        try:
+            # Пытаемся получить актуальный username / first_name
+            chat = await bot.get_chat(user_id)
+            if chat.username:
+                username = f"@{chat.username}"
+            elif chat.first_name:
+                username = chat.first_name
+        except:
+            username = "—"
+
+        body += (
+            f"{idx:3d}. user_id={user_id} | "
+            f"username={username} | "
+            f"first_seen={first_seen or '-'} | "
+            f"last_seen={last_seen or '-'} | "
+            f"queries={total_queries}\n"
+        )
+
+    if not rows:
+        body = "В текущей базе данных пока нет пользователей.\n"
+
+    full_report = header + body
+
+    # === Дописываем в файл (append), а не перезаписываем ===
+    with report_path.open(mode="a", encoding="utf-8") as f:
+        f.write(full_report + "\n\n")
+
+    # Отправляем файл админу
     await target_message.answer_document(
         document=types.FSInputFile(str(report_path)),
-        caption=f"Список пользователей: {get_users_count()}",
+        caption=f"Отчёт по пользователям ({timestamp})\nВ БД сейчас: {current_count} чел.",
     )
-
 
 async def broadcast_text_to_all_users(text: str) -> tuple[int, int]:
     user_ids = get_all_user_ids()
